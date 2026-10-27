@@ -12,7 +12,16 @@ export interface SandboxOpts {
   sandboxId?: string | null; // Daytona: reconnect to this if set
 }
 
+// Extra providers registered at runtime (e.g. the load test's in-memory sandbox), keyed by
+// SANDBOX_PROVIDER. Built-ins below stay the default path.
+const providers = new Map<string, (opts: SandboxOpts) => Promise<Sandbox>>();
+export function registerSandboxProvider(name: string, create: (opts: SandboxOpts) => Promise<Sandbox>): void {
+  providers.set(name, create);
+}
+
 export async function createSandbox(opts: SandboxOpts): Promise<Sandbox> {
+  const custom = providers.get(process.env.SANDBOX_PROVIDER ?? "");
+  if (custom) return custom(opts);
   if (process.env.SANDBOX_PROVIDER === "daytona") {
     if (opts.sandboxId) {
       try {

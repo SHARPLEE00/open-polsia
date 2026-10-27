@@ -1,8 +1,8 @@
 // Dashboard server — self-contained Node http: REST + the retro/ASCII page (Criterion 7).
 // Polls /api/state live; approve/reject suggested tasks (the autonomy gate's UI surface).
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type Server } from "node:http";
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { getAgentStatus, getActivity, pushActivity } from "../core/status.ts";
 import { PgStore } from "../core/pg-store.ts";
 import { bootstrap, db, ensureCompany } from "../core/db.ts";
@@ -32,30 +32,25 @@ import { agents } from "../agents/index.ts";
 import { withCompanyContext, getDocument } from "../core/memory.ts";
 import { buildChatContext, maybeCompact } from "../core/chat-memory.ts";
 import type { ToolContext } from "../tools/registry.ts";
+import type { AgentRuntime } from "../runtime/types.ts";
+import type { Store } from "../core/store.ts";
 import { PAGE } from "./dashboard-page.ts";
 
 const COMPANY = "demo";
-const store = new PgStore();
-const runtime = new PiRuntime();
 
-// Background worker — ON by default (set POLSIA_WORKER=off to disable, e.g. for cost-frozen demos).
-// It drains the queue ONE task at a time (respecting the autonomy gate via dispatchNext). This is
-// what makes chat-created / approved tasks actually execute, live in the feed.
-let workerOn = process.env.POLSIA_WORKER !== "off";
-let busy = false; // single execution lock shared by the ad-hoc worker AND the daily cron.
-async function workerTick() {
-  if (!workerOn || busy) return;
-  busy = true;
-  try {
-    const id = await nextAdHoc(COMPANY); // chat/approved todo + resume in-flight; NOT suggested
-    if (id) await runToCompletion(store, runtime, id); // no CEO review for ad-hoc work
-  } catch (err) {
-    console.error("[worker]", err);
-  } finally {
-    busy = false;
-  }
+export interface DashboardOpts {
+  store?: Store;
+  runtime?: AgentRuntime;
+  port?: number;
+  /** Background worker poll interval (default 3000ms). */
+  workerIntervalMs?: number;
 }
-setInterval(() => void workerTick(), 3000);
+
+export interface Dashboard {
+  server: Server;
+  port: number;
+  stop(): Promise<void>;
+}
 
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve) => {
@@ -65,80 +60,7 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-/** Run the orchestrator (chat agent, no bash) on the user's message → it may create_task → todo. */
 type ChatEvent = { type: "text"; delta: string } | { type: "tool"; name: string };
-
-async function chat(message: string, baseUrl: string, onEvent?: (e: ChatEvent) => void): Promise<string> {
-  // J.7 Path B: pi runs stateless — WE supply memory (rolling summary + recent tail), owned in our DB.
-  const context = await buildChatContext(COMPANY); // before saving the new turn
-  await saveMessage(COMPANY, "user", message);
-  const prompt = context ? `${context}\n\nUser: ${message}` : message;
-
-  const ctx: ToolContext = {
-    taskId: "chat",
-    log: (type, payload) => {
-      pushActivity("chat", type, payload);
-      if (type === "tool_call") {
-        const name = (payload as { name?: string })?.name;
-        if (name) onEvent?.({ type: "tool", name });
-      }
-    },
-  };
-  let reply = "";
-  for await (const ev of runtime.run({
-    system: await withCompanyContext(COMPANY, agents.chat.prompt),
-    prompt,
-    tools: agents.chat.makeTools({ store, companyId: COMPANY, baseUrl }),
-    toolCtx: ctx,
-  })) {
-    if (ev.type === "text") { reply += ev.text; onEvent?.({ type: "text", delta: ev.text }); }
-    if (ev.type === "error") { reply += `\n[error] ${ev.message}`; onEvent?.({ type: "text", delta: `\n[error] ${ev.message}` }); }
-  }
-  reply = reply.trim();
-  await saveMessage(COMPANY, "assistant", reply);
-  await maybeCompact(COMPANY); // fold older turns into the summary if the tail grew
-  return reply;
-}
-
-async function state() {
-  const [counts, tasks, events, reports, co, docs, metrics] = await Promise.all([
-    queueCounts(COMPANY),
-    store.list(COMPANY),
-    recentEvents(COMPANY, 50),
-    recentReports(COMPANY, 10),
-    db()<{ name: string; onboarded_at: Date | null; profile: { website?: string } }[]>`SELECT name, onboarded_at, profile FROM companies WHERE id=${COMPANY}`,
-    db()<{ type: string; updated_at: Date }[]>`SELECT type, updated_at FROM documents WHERE company_id=${COMPANY} AND content<>'' ORDER BY type`,
-    visitMetrics(COMPANY),
-  ]);
-  return {
-    company: co[0]?.name ?? COMPANY,
-    onboarded: !!co[0]?.onboarded_at,
-    worker: workerOn,
-    busy,
-    counts,
-    agent: getAgentStatus(), // who's running, their mood (→ ASCII face) + last message
-    business: {
-      // visitors now LIVE via the beacon; revenue stays a placeholder until Stripe (Phase 3).
-      visitors: metrics.visitsToday,
-      revenue: "$0.00",
-      shippedToday: counts.completedToday,
-      docs: docs.length,
-    },
-    documents: docs.map((d) => ({ type: d.type, updated: d.updated_at.toISOString().slice(0, 10) })),
-    reports: reports.map((r) => ({ id: r.id, type: r.type, name: r.name, created: r.created_at.toISOString().slice(0, 10) })),
-    website: co[0]?.profile?.website ?? null, // set by deployApp (Phase 2)
-    tasks: tasks.map((t) => ({ id: t.id, tag: t.tag, priority: t.priority, status: t.status, title: t.title })),
-    // Merge DB task_events (engineering/research) with the live ring (ceo/onboarding) → one feed.
-    events: [
-      ...events.map((e) => ({ ts: e.ts, actor: e.actor, type: e.type, text: typeof e.payload === "object" ? JSON.stringify(e.payload) : String(e.payload) })),
-      ...getActivity().map((a) => ({ ts: a.ts, actor: a.actor, type: a.type, text: a.text })),
-    ]
-      .sort((a, b) => a.ts.getTime() - b.ts.getTime())
-      .slice(-80)
-      .map((e) => ({ ts: e.ts.toISOString().slice(11, 19), actor: e.actor, type: e.type, payload: e.text.slice(0, 140) })),
-    report: reports[0]?.content ?? null,
-  };
-}
 
 const FONTS_DIR = fileURLToPath(new URL("../../node_modules/geist/dist/fonts", import.meta.url));
 const FONT_FILES: Record<string, string> = {
@@ -151,14 +73,113 @@ function send(res: import("node:http").ServerResponse, code: number, body: strin
   res.end(body);
 }
 
-async function main() {
+/**
+ * Build + start the control-plane server. Store/runtime are injectable so the load test
+ * (scripts/loadtest.ts) can drive the real scheduler with a simulated LLM runtime.
+ */
+export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboard> {
+  const store = opts.store ?? new PgStore();
+  const runtime = opts.runtime ?? new PiRuntime();
+
+  // Background worker — ON by default (set POLSIA_WORKER=off to disable, e.g. for cost-frozen demos).
+  // It drains the queue ONE task at a time (respecting the autonomy gate via dispatchNext). This is
+  // what makes chat-created / approved tasks actually execute, live in the feed.
+  let workerOn = process.env.POLSIA_WORKER !== "off";
+  let busy = false; // single execution lock shared by the ad-hoc worker AND the daily cron.
+  async function workerTick() {
+    if (!workerOn || busy) return;
+    busy = true;
+    try {
+      const id = await nextAdHoc(COMPANY); // chat/approved todo + resume in-flight; NOT suggested
+      if (id) await runToCompletion(store, runtime, id); // no CEO review for ad-hoc work
+    } catch (err) {
+      console.error("[worker]", err);
+    } finally {
+      busy = false;
+    }
+  }
+  const workerTimer = setInterval(() => void workerTick(), opts.workerIntervalMs ?? 3000);
+
+  /** Run the orchestrator (chat agent, no bash) on the user's message → it may create_task → todo. */
+  async function chat(message: string, baseUrl: string, onEvent?: (e: ChatEvent) => void): Promise<string> {
+    // J.7 Path B: pi runs stateless — WE supply memory (rolling summary + recent tail), owned in our DB.
+    const context = await buildChatContext(COMPANY); // before saving the new turn
+    await saveMessage(COMPANY, "user", message);
+    const prompt = context ? `${context}\n\nUser: ${message}` : message;
+
+    const ctx: ToolContext = {
+      taskId: "chat",
+      log: (type, payload) => {
+        pushActivity("chat", type, payload);
+        if (type === "tool_call") {
+          const name = (payload as { name?: string })?.name;
+          if (name) onEvent?.({ type: "tool", name });
+        }
+      },
+    };
+    let reply = "";
+    for await (const ev of runtime.run({
+      system: await withCompanyContext(COMPANY, agents.chat.prompt),
+      prompt,
+      tools: agents.chat.makeTools({ store, companyId: COMPANY, baseUrl }),
+      toolCtx: ctx,
+    })) {
+      if (ev.type === "text") { reply += ev.text; onEvent?.({ type: "text", delta: ev.text }); }
+      if (ev.type === "error") { reply += `\n[error] ${ev.message}`; onEvent?.({ type: "text", delta: `\n[error] ${ev.message}` }); }
+    }
+    reply = reply.trim();
+    await saveMessage(COMPANY, "assistant", reply);
+    await maybeCompact(COMPANY); // fold older turns into the summary if the tail grew
+    return reply;
+  }
+
+  async function state() {
+    const [counts, tasks, events, reports, co, docs, metrics] = await Promise.all([
+      queueCounts(COMPANY),
+      store.list(COMPANY),
+      recentEvents(COMPANY, 50),
+      recentReports(COMPANY, 10),
+      db()<{ name: string; onboarded_at: Date | null; profile: { website?: string } }[]>`SELECT name, onboarded_at, profile FROM companies WHERE id=${COMPANY}`,
+      db()<{ type: string; updated_at: Date }[]>`SELECT type, updated_at FROM documents WHERE company_id=${COMPANY} AND content<>'' ORDER BY type`,
+      visitMetrics(COMPANY),
+    ]);
+    return {
+      company: co[0]?.name ?? COMPANY,
+      onboarded: !!co[0]?.onboarded_at,
+      worker: workerOn,
+      busy,
+      counts,
+      agent: getAgentStatus(), // who's running, their mood (→ ASCII face) + last message
+      business: {
+        // visitors now LIVE via the beacon; revenue stays a placeholder until Stripe (Phase 3).
+        visitors: metrics.visitsToday,
+        revenue: "$0.00",
+        shippedToday: counts.completedToday,
+        docs: docs.length,
+      },
+      documents: docs.map((d) => ({ type: d.type, updated: d.updated_at.toISOString().slice(0, 10) })),
+      reports: reports.map((r) => ({ id: r.id, type: r.type, name: r.name, created: r.created_at.toISOString().slice(0, 10) })),
+      website: co[0]?.profile?.website ?? null, // set by deployApp (Phase 2)
+      tasks: tasks.map((t) => ({ id: t.id, tag: t.tag, priority: t.priority, status: t.status, title: t.title })),
+      // Merge DB task_events (engineering/research) with the live ring (ceo/onboarding) → one feed.
+      events: [
+        ...events.map((e) => ({ ts: e.ts, actor: e.actor, type: e.type, text: typeof e.payload === "object" ? JSON.stringify(e.payload) : String(e.payload) })),
+        ...getActivity().map((a) => ({ ts: a.ts, actor: a.actor, type: a.type, text: a.text })),
+      ]
+        .sort((a, b) => a.ts.getTime() - b.ts.getTime())
+        .slice(-80)
+        .map((e) => ({ ts: e.ts.toISOString().slice(11, 19), actor: e.actor, type: e.type, payload: e.text.slice(0, 140) })),
+      report: reports[0]?.content ?? null,
+    };
+  }
+
   await bootstrap();
   await ensureCompany(COMPANY, "BrewBox", "brewbox");
   const recovered = await requeueOrphaned(COMPANY); // crash recovery for tasks interrupted mid-run
   if (recovered) console.log(`↻ recovered ${recovered} interrupted task(s) → needs_continuation`);
-  const port = Number(process.env.PORT ?? 4317);
+  const port = opts.port ?? Number(process.env.PORT ?? 4317);
 
-  createServer(async (req, res) => {
+  const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url ?? "/", `http://localhost`);
       // Auth gate (cloud deploy): if POLSIA_DASHBOARD_PASSWORD is set, everything except the
@@ -291,10 +312,25 @@ async function main() {
     } catch (err) {
       send(res, 500, JSON.stringify({ error: err instanceof Error ? err.message : String(err) }));
     }
-  }).listen(port, () => console.log(`▟ open-polsia dashboard → http://localhost:${port}`));
+  });
+  await new Promise<void>((resolve) => server.listen(port, resolve));
+  const actualPort = (server.address() as { port: number }).port;
+  console.log(`▟ open-polsia dashboard → http://localhost:${actualPort}`);
+  return {
+    server,
+    port: actualPort,
+    stop: async () => {
+      clearInterval(workerTimer);
+      workerOn = false;
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+// Run directly (`pnpm dashboard`) → start with the real store + pi runtime.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startDashboard().catch((e) => {
+    console.error(e);
+    process.exit(1);
+  });
+}
