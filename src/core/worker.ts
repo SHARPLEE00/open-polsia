@@ -34,11 +34,11 @@ export async function runToCompletion(
   maxRuns = 5,
 ): Promise<TaskStatus> {
   for (let i = 0; i < maxRuns; i++) {
-    const t = await store.get(taskId);
+    const t = await store.get(taskId, { events: false });
     if (!t) return "failed";
     if (["completed", "failed", "blocked", "rejected"].includes(t.status)) return t.status;
     await runTask(store, runtime, t);
-    const after = await store.get(taskId);
+    const after = await store.get(taskId, { events: false });
     if (after?.status !== "needs_continuation") return after?.status ?? "failed";
     // else: resume immediately (next loop iteration)
   }
@@ -67,7 +67,7 @@ export async function runTask(store: Store, runtime: AgentRuntime, task: Task): 
       if (ev.type === "error") await store.event(task.id, "system", "note", { error: ev.message });
     }
     idleAgent();
-    const rt = (await store.get(task.id))!;
+    const rt = (await store.get(task.id, { events: false }))!;
     if (rt.status === "in_progress") {
       await store.setStatus(task.id, "needs_continuation", {
         summary: "Research run ended without asserting completion.",
@@ -123,7 +123,7 @@ export async function runTask(store: Store, runtime: AgentRuntime, task: Task): 
     idleAgent();
 
     // STATUS INTEGRITY GUARD: the agent must have asserted completed/failed.
-    const t = (await store.get(task.id))!;
+    const t = (await store.get(task.id, { events: false }))!;
     if (t.status === "in_progress") {
       await store.setStatus(task.id, "needs_continuation", {
         summary: "Agent ended without asserting complete_task/fail_task — not auto-completed.",

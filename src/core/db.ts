@@ -9,7 +9,15 @@ const DEFAULT_URL = "postgres://postgres:polsia@localhost:5433/polsia";
 let _sql: Sql | null = null;
 
 export function db(): Sql {
-  if (!_sql) _sql = postgres(process.env.DATABASE_URL ?? DEFAULT_URL, { onnotice: () => {} });
+  if (!_sql) {
+    _sql = postgres(process.env.DATABASE_URL ?? DEFAULT_URL, {
+      onnotice: () => {},
+      // Agents' event writes, the worker, chat and dashboard polls share this pool; the driver
+      // default (10) queues requests behind each other under parallel load.
+      max: Number(process.env.POLSIA_DB_POOL_MAX ?? 20),
+      idle_timeout: 60,
+    });
+  }
   return _sql;
 }
 
@@ -28,6 +36,8 @@ export async function bootstrap(): Promise<void> {
   await sql`ALTER TABLE companies ADD COLUMN IF NOT EXISTS onboarded_at TIMESTAMPTZ`;
   await sql`ALTER TABLE companies ADD COLUMN IF NOT EXISTS sandbox_id TEXT`; // Option A: persistent sandbox per company (→ per project later)
   await sql`ALTER TABLE companies ADD COLUMN IF NOT EXISTS proxy_token TEXT`; // secret-proxy: bearer token deployed apps use to call /api/proxy/*
+  await sql`CREATE INDEX IF NOT EXISTS companies_slug_idx ON companies(slug)`; // beacon lookups
+  await sql`CREATE INDEX IF NOT EXISTS companies_proxy_token_idx ON companies(proxy_token)`; // secret-proxy auth
   await sql`
     CREATE TABLE IF NOT EXISTS tasks (
       id           TEXT PRIMARY KEY,
@@ -53,6 +63,9 @@ export async function bootstrap(): Promise<void> {
       payload   JSONB NOT NULL DEFAULT '{}'::jsonb
     )`;
   await sql`CREATE INDEX IF NOT EXISTS task_events_task_idx ON task_events(task_id, id)`;
+  // Scheduler hot paths: dispatch selectors (nextAdHoc/nextProposal), queue counts, task lists.
+  await sql`CREATE INDEX IF NOT EXISTS tasks_company_status_idx ON tasks(company_id, status, priority DESC, created_at)`;
+  await sql`CREATE INDEX IF NOT EXISTS tasks_company_created_idx ON tasks(company_id, created_at DESC)`;
   await sql`
     CREATE TABLE IF NOT EXISTS executions (
       id          BIGSERIAL PRIMARY KEY,

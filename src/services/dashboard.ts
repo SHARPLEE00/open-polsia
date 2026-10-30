@@ -62,11 +62,34 @@ function readBody(req: IncomingMessage): Promise<string> {
 
 type ChatEvent = { type: "text"; delta: string } | { type: "tool"; name: string };
 
+/**
+ * Tiny TTL cache for hot, rarely-changing lookups (beacon slug → company, proxy token → company).
+ * Misses (null) are never cached, so a just-onboarded slug or just-minted token works immediately
+ * and junk keys can't fill the map.
+ */
+function ttlCache<V>(ttlMs: number, max = 1000) {
+  const m = new Map<string, { v: V; exp: number }>();
+  return async (key: string, load: () => Promise<V | null>): Promise<V | null> => {
+    const hit = m.get(key);
+    if (hit && hit.exp > Date.now()) return hit.v;
+    const v = await load();
+    if (v === null) return null;
+    if (m.size >= max) m.delete(m.keys().next().value!);
+    m.set(key, { v, exp: Date.now() + ttlMs });
+    return v;
+  };
+}
+const slugCache = ttlCache<string>(30_000);
+const proxyTokenCache = ttlCache<string>(30_000);
+
 const FONTS_DIR = fileURLToPath(new URL("../../node_modules/geist/dist/fonts", import.meta.url));
 const FONT_FILES: Record<string, string> = {
   "pixel.woff2": "geist-pixel/GeistPixel-Square.woff2",
   "sans.woff2": "geist-sans/Geist-Variable.woff2",
 };
+
+const PIXEL = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
+const fontCache = new Map<string, Buffer>(); // read once; readFileSync per request blocked the loop
 
 function send(res: import("node:http").ServerResponse, code: number, body: string, type = "application/json") {
   res.writeHead(code, { "content-type": type });
@@ -86,19 +109,44 @@ export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboar
   // what makes chat-created / approved tasks actually execute, live in the feed.
   let workerOn = process.env.POLSIA_WORKER !== "off";
   let busy = false; // single execution lock shared by the ad-hoc worker AND the daily cron.
+  const DRAIN_MAX = Number(process.env.POLSIA_WORKER_DRAIN_MAX ?? 10);
   async function workerTick() {
     if (!workerOn || busy) return;
     busy = true;
     try {
-      const id = await nextAdHoc(COMPANY); // chat/approved todo + resume in-flight; NOT suggested
-      if (id) await runToCompletion(store, runtime, id); // no CEO review for ad-hoc work
+      // Drain the queue back-to-back (still ONE task at a time) instead of one task per poll
+      // interval — otherwise every queued task waited up to a full tick and backlogs compounded.
+      // A task is run at most once per pass (one that hit the resume cap comes back first from
+      // nextAdHoc and must not spin), and a pass is bounded so the cron/run-link can get the lock.
+      const ran = new Set<string>();
+      while (workerOn && ran.size < DRAIN_MAX) {
+        const id = await nextAdHoc(COMPANY); // chat/approved todo + resume in-flight; NOT suggested
+        if (!id || ran.has(id)) break;
+        ran.add(id);
+        await runToCompletion(store, runtime, id); // no CEO review for ad-hoc work
+      }
+      if (ran.size >= DRAIN_MAX) kickWorker(); // more queued: continue after yielding the lock
     } catch (err) {
       console.error("[worker]", err);
     } finally {
       busy = false;
     }
   }
+  // The interval is now only a safety net; enqueue paths call kickWorker() for immediate dispatch.
   const workerTimer = setInterval(() => void workerTick(), opts.workerIntervalMs ?? 3000);
+  const kickWorker = () => setImmediate(() => void workerTick());
+
+  // /api/state is polled by every open dashboard; coalesce concurrent polls onto one in-flight
+  // build and reuse it for a short window so N viewers don't cost N× the queries.
+  const STATE_TTL_MS = Number(process.env.POLSIA_STATE_TTL_MS ?? 250);
+  let stateCache: { at: number; body: Promise<string> } | null = null;
+  function cachedState(): Promise<string> {
+    if (stateCache && Date.now() - stateCache.at < STATE_TTL_MS) return stateCache.body;
+    const body = state().then((s) => JSON.stringify(s));
+    stateCache = { at: Date.now(), body };
+    body.catch(() => { if (stateCache?.body === body) stateCache = null; });
+    return body;
+  }
 
   /** Run the orchestrator (chat agent, no bash) on the user's message → it may create_task → todo. */
   async function chat(message: string, baseUrl: string, onEvent?: (e: ChatEvent) => void): Promise<string> {
@@ -129,6 +177,7 @@ export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboar
     }
     reply = reply.trim();
     await saveMessage(COMPANY, "assistant", reply);
+    kickWorker(); // the orchestrator may have queued/approved work — dispatch it now
     await maybeCompact(COMPANY); // fold older turns into the summary if the tail grew
     return reply;
   }
@@ -163,7 +212,7 @@ export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboar
       tasks: tasks.map((t) => ({ id: t.id, tag: t.tag, priority: t.priority, status: t.status, title: t.title })),
       // Merge DB task_events (engineering/research) with the live ring (ceo/onboarding) → one feed.
       events: [
-        ...events.map((e) => ({ ts: e.ts, actor: e.actor, type: e.type, text: typeof e.payload === "object" ? JSON.stringify(e.payload) : String(e.payload) })),
+        ...events.map((e) => ({ ts: e.ts, actor: e.actor, type: e.type, text: e.preview })),
         ...getActivity().map((a) => ({ ts: a.ts, actor: a.actor, type: a.type, text: a.text })),
       ]
         .sort((a, b) => a.ts.getTime() - b.ts.getTime())
@@ -195,7 +244,8 @@ export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboar
       if (url.pathname === "/") return send(res, 200, PAGE, "text/html; charset=utf-8");
       const font = url.pathname.match(/^\/fonts\/([\w.]+)$/);
       if (font && FONT_FILES[font[1]]) {
-        const buf = readFileSync(`${FONTS_DIR}/${FONT_FILES[font[1]]}`);
+        let buf = fontCache.get(font[1]);
+        if (!buf) fontCache.set(font[1], (buf = readFileSync(`${FONTS_DIR}/${FONT_FILES[font[1]]}`)));
         res.writeHead(200, { "content-type": "font/woff2", "cache-control": "max-age=86400" });
         return res.end(buf);
       }
@@ -203,29 +253,30 @@ export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboar
       // record the hit and return a 1x1 gif. First-party infra — the app never decides to add it.
       if (url.pathname === "/api/beacon/pixel") {
         const slug = url.searchParams.get("s") ?? "";
-        const cid = await companyIdForSlug(slug);
-        if (cid) {
-          await recordVisit(cid, {
-            visitorId: url.searchParams.get("v") ?? undefined,
-            path: url.searchParams.get("p") ?? undefined,
-            referer: req.headers.referer,
-            ua: req.headers["user-agent"],
-          });
-        }
-        const gif = Buffer.from("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", "base64");
+        const visit = {
+          visitorId: url.searchParams.get("v") ?? undefined,
+          path: url.searchParams.get("p") ?? undefined,
+          referer: req.headers.referer,
+          ua: req.headers["user-agent"],
+        };
+        // Answer the pixel first; recording the hit is off the request path.
         res.writeHead(200, { "content-type": "image/gif", "cache-control": "no-store" });
-        return res.end(gif);
+        res.end(PIXEL);
+        void slugCache(slug, () => companyIdForSlug(slug))
+          .then((cid) => (cid ? recordVisit(cid, visit) : undefined))
+          .catch((e: unknown) => console.error("[beacon]", e));
+        return;
       }
       // Phase 2 — secret-proxy: deployed apps authenticate with their per-company bearer token
       // (POLSIA_PROXY_TOKEN, injected at deploy time); raw LLM keys never leave the control plane.
       if (url.pathname === "/api/proxy/llm" && req.method === "POST") {
         const bearer = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
-        const proxyCompany = await companyIdForProxyToken(bearer);
+        const proxyCompany = await proxyTokenCache(bearer, () => companyIdForProxyToken(bearer));
         if (!proxyCompany) return send(res, 401, JSON.stringify({ error: "invalid proxy token" }));
         const result = await proxyLlm(JSON.parse((await readBody(req)) || "{}"));
         return send(res, result.status, JSON.stringify(result.json));
       }
-      if (url.pathname === "/api/state") return send(res, 200, JSON.stringify(await state()));
+      if (url.pathname === "/api/state") return send(res, 200, await cachedState());
       if (url.pathname === "/api/report" && req.method === "GET") {
         const id = Number(url.searchParams.get("id"));
         return send(res, 200, JSON.stringify(await getReport(COMPANY, id)));
@@ -240,10 +291,13 @@ export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboar
       const m = url.pathname.match(/^\/api\/(approve|reject)\/([a-z0-9]+)$/);
       if (m && req.method === "POST") {
         m[1] === "approve" ? await approveTask(m[2]) : await rejectTask(m[2]);
+        stateCache = null; // the founder should see their click reflected on the next poll
+        if (m[1] === "approve") kickWorker();
         return send(res, 200, JSON.stringify({ ok: true }));
       }
       if (url.pathname === "/api/worker" && req.method === "POST") {
         workerOn = url.searchParams.get("on") === "true";
+        if (workerOn) kickWorker();
         return send(res, 200, JSON.stringify({ ok: true, worker: workerOn }));
       }
       if (url.pathname === "/api/reset" && req.method === "POST") {
@@ -266,20 +320,25 @@ export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboar
             console.error("[onboard]", e);
           } finally {
             busy = false;
+            kickWorker();
           }
         })();
         return send(res, 200, JSON.stringify({ ok: true, started: true }));
       }
       if (url.pathname === "/api/cron" && req.method === "POST") {
         // The daily cron: run top proposal to completion → CEO review/report/propose.
+        // Runs in the background (like /api/onboard): a full cycle is minutes of LLM work, and
+        // holding the request open for it tied up a socket and timed out proxies/clients.
+        // The page polls /api/state to watch it; pass ?wait=true for the old blocking behaviour.
         if (busy) return send(res, 200, JSON.stringify({ ok: false, reason: "busy" }));
         busy = true;
-        try {
-          const r = await runDailyCron(store, runtime, COMPANY);
-          return send(res, 200, JSON.stringify({ ok: true, ...r }));
-        } finally {
+        const cycle = runDailyCron(store, runtime, COMPANY).finally(() => {
           busy = false;
-        }
+          kickWorker();
+        });
+        if (url.searchParams.get("wait") === "true") return send(res, 200, JSON.stringify({ ok: true, ...(await cycle) }));
+        cycle.catch((e: unknown) => console.error("[cron]", e));
+        return send(res, 202, JSON.stringify({ ok: true, started: true }));
       }
       if (url.pathname === "/api/chat" && req.method === "POST") {
         const { message } = JSON.parse((await readBody(req)) || "{}");
@@ -302,7 +361,10 @@ export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboar
           if (t.status === "suggested") await approveTask(t.id);
           if (!busy) {
             busy = true;
-            void runToCompletion(store, runtime, t.id).catch((e: unknown) => console.error(e)).finally(() => (busy = false));
+            void runToCompletion(store, runtime, t.id).catch((e: unknown) => console.error(e)).finally(() => {
+              busy = false;
+              kickWorker();
+            });
           }
           return send(res, 200, `<body style="background:#0a0a0a;color:#39ff14;font-family:monospace;padding:2rem">▶ running task ${t.id} — watch the <a style="color:#e0b341" href="/">dashboard</a></body>`, "text/html");
         }
@@ -322,6 +384,8 @@ export async function startDashboard(opts: DashboardOpts = {}): Promise<Dashboar
     stop: async () => {
       clearInterval(workerTimer);
       workerOn = false;
+      // Let an in-flight execution finish its writes before the caller closes the DB pool.
+      while (busy) await new Promise((r) => setTimeout(r, 50));
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };

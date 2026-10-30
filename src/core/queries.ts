@@ -59,8 +59,10 @@ export async function createReport(
 /** Recent activity across all of a company's tasks — for the dashboard feed. */
 export async function recentEvents(companyId: string, limit = 40) {
   const sql = db();
-  return sql<{ ts: Date; type: string; actor: string; payload: unknown; task_id: string }[]>`
-    SELECT e.ts, e.type, e.actor, e.payload, e.task_id
+  // The feed only shows a short preview, and tool_result payloads can carry whole files/stdout —
+  // truncate in SQL instead of shipping and parsing full JSONB on every dashboard poll.
+  return sql<{ ts: Date; type: string; actor: string; preview: string; task_id: string }[]>`
+    SELECT e.ts, e.type, e.actor, left(e.payload::text, 200) AS preview, e.task_id
     FROM task_events e JOIN tasks t ON t.id = e.task_id
     WHERE t.company_id = ${companyId}
     ORDER BY e.id DESC LIMIT ${limit}`;
@@ -215,13 +217,15 @@ export async function nextAdHoc(companyId: string): Promise<string | null> {
  * and return its id (so the cron runs it to completion). Returns null if there are no proposals.
  */
 export async function nextProposal(companyId: string): Promise<string | null> {
-  const sql = db();
-  const [p] = await sql<{ id: string }[]>`
-    SELECT id FROM tasks WHERE company_id = ${companyId} AND status='suggested'
-    ORDER BY priority DESC, created_at ASC LIMIT 1`;
-  if (!p) return null;
-  await sql`UPDATE tasks SET status='todo' WHERE id = ${p.id}`;
-  return p.id;
+  // One atomic claim (select + promote) so concurrent dispatchers never promote the same proposal.
+  const [p] = await db()<{ id: string }[]>`
+    UPDATE tasks SET status='todo'
+    WHERE id = (
+      SELECT id FROM tasks WHERE company_id = ${companyId} AND status='suggested'
+      ORDER BY priority DESC, created_at ASC LIMIT 1
+      FOR UPDATE SKIP LOCKED)
+    RETURNING id`;
+  return p?.id ?? null;
 }
 
 /**

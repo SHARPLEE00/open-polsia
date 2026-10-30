@@ -47,6 +47,66 @@ async function hydrate(row: TaskRow, withEvents: boolean): Promise<Task> {
   };
 }
 
+type EventRow = { task_id: string; type: string; actor: string; payload: string };
+
+/**
+ * Coalesces task_events inserts into one multi-row INSERT per event-loop turn. Agents log two
+ * events per tool call (fire-and-forget), so under parallel load one-INSERT-per-event saturates
+ * the pool and queues the scheduler's own reads behind log writes. Order is preserved (single
+ * queue, one flush in flight) and every append resolves only once its row is durable.
+ */
+class EventWriter {
+  private pending: { row: EventRow; done: (err?: unknown) => void }[] = [];
+  private flushing = false;
+
+  append(row: EventRow): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.pending.push({ row, done: (err) => (err ? reject(err) : resolve()) });
+      if (!this.flushing) setImmediate(() => void this.flush());
+    });
+  }
+
+  private async flush(): Promise<void> {
+    if (this.flushing) return;
+    this.flushing = true;
+    try {
+      while (this.pending.length) {
+        const batch = this.pending.splice(0, 500);
+        try {
+          await insertEvents(batch.map((b) => b.row));
+          for (const b of batch) b.done();
+        } catch {
+          // One bad row (e.g. FK on a deleted task) must not drop its neighbours' logs:
+          // fall back to row-by-row so each caller gets its own result.
+          for (const b of batch) {
+            try {
+              await insertEvents([b.row]);
+              b.done();
+            } catch (err) {
+              b.done(err);
+            }
+          }
+        }
+      }
+    } finally {
+      this.flushing = false;
+    }
+  }
+}
+
+async function insertEvents(rows: EventRow[]): Promise<void> {
+  const sql = db();
+  await sql`
+    INSERT INTO task_events (task_id, type, actor, payload)
+    SELECT * FROM unnest(
+      ${sql.array(rows.map((r) => r.task_id))}::text[],
+      ${sql.array(rows.map((r) => r.type))}::text[],
+      ${sql.array(rows.map((r) => r.actor))}::text[],
+      ${sql.array(rows.map((r) => r.payload))}::jsonb[])`;
+}
+
+const events = new EventWriter();
+
 export class PgStore implements Store {
   async create(input: CreateTaskInput): Promise<Task> {
     const sql = db();
@@ -60,9 +120,9 @@ export class PgStore implements Store {
     return hydrate(row, true);
   }
 
-  async get(id: string): Promise<Task | undefined> {
+  async get(id: string, opts?: { events?: boolean }): Promise<Task | undefined> {
     const [row] = await db()<TaskRow[]>`SELECT * FROM tasks WHERE id = ${id}`;
-    return row ? hydrate(row, true) : undefined;
+    return row ? hydrate(row, opts?.events ?? true) : undefined;
   }
 
   async nextTodo(companyId: string): Promise<Task | undefined> {
@@ -94,10 +154,7 @@ export class PgStore implements Store {
   }
 
   async event(taskId: string, actor: string, type: TaskEvent["type"], payload: unknown): Promise<void> {
-    const sql = db();
-    await sql`
-      INSERT INTO task_events (task_id, type, actor, payload)
-      VALUES (${taskId}, ${type}, ${actor}, ${sql.json((payload ?? {}) as Parameters<typeof sql.json>[0])})`;
+    await events.append({ task_id: taskId, type, actor, payload: JSON.stringify(payload ?? {}) });
   }
 
   async list(companyId: string, status?: TaskStatus): Promise<Task[]> {

@@ -6,6 +6,7 @@
 const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
 const DEFAULT_MODEL = "claude-opus-4-8";
 const MAX_TOKENS_CAP = 4096; // per-request cap for customer apps
+const UPSTREAM_TIMEOUT_MS = Number(process.env.POLSIA_LLM_TIMEOUT_MS ?? 120_000);
 
 interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -34,11 +35,19 @@ export async function proxyLlm(body: LlmProxyRequest): Promise<{ status: number;
   const model = body.model?.startsWith("claude-") ? body.model : DEFAULT_MODEL;
   const maxTokens = Math.min(Math.max(1, body.max_tokens ?? 1024), MAX_TOKENS_CAP);
 
-  const res = await fetch(ANTHROPIC_API, {
-    method: "POST",
-    headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({ model, max_tokens: maxTokens, ...(system ? { system } : {}), messages }),
-  });
+  // Bounded: a hung upstream must not pin a control-plane socket (and its caller) indefinitely.
+  let res: Response;
+  try {
+    res = await fetch(ANTHROPIC_API, {
+      method: "POST",
+      headers: { "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+      body: JSON.stringify({ model, max_tokens: maxTokens, ...(system ? { system } : {}), messages }),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+  } catch (err) {
+    if (err instanceof Error && err.name === "TimeoutError") return { status: 504, json: { error: "upstream timeout" } };
+    throw err;
+  }
   const data = (await res.json()) as {
     id?: string;
     model?: string;

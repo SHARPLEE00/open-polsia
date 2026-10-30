@@ -15,7 +15,8 @@ export interface CreateTaskInput {
 
 export interface Store {
   create(input: CreateTaskInput): Promise<Task>;
-  get(id: string): Promise<Task | undefined>;
+  /** `events: false` skips loading the event timeline (status checks on the scheduler hot path). */
+  get(id: string, opts?: { events?: boolean }): Promise<Task | undefined>;
   nextTodo(companyId: string): Promise<Task | undefined>;
   setStatus(id: string, status: TaskStatus, result?: TaskResult): Promise<void>;
   setPriority(id: string, priority: TaskPriority): Promise<void>;
@@ -45,7 +46,7 @@ export class InMemoryStore implements Store {
     await this.event(task.id, "system", "status_change", { to: task.status });
     return task;
   }
-  async get(id: string) {
+  async get(id: string, _opts?: { events?: boolean }) {
     return this.tasks.get(id);
   }
   async nextTodo(companyId: string) {
