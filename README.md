@@ -50,6 +50,7 @@ pnpm ceo supervised       # proposals stay 'suggested' until you approve them in
 pnpm autopilot            # one autonomous tick: CEO plans → dispatch the top task (needs Docker)
 pnpm spike "build a landing page for X"   # drive orchestrator → engineering directly (needs Docker)
 pnpm test:guard           # status-integrity guard test (no LLM, no DB)
+pnpm loadtest             # scheduler load test: parallel simulated agents vs the real API + Postgres (wipes the demo company)
 pnpm typecheck
 ```
 

@@ -31,12 +31,15 @@ export async function getDocument(companyId: string, type: string): Promise<stri
 /** Assemble the company-context block to prepend to an agent's system prompt. */
 export async function loadCompanyContext(companyId: string): Promise<string> {
   const sql = db();
-  const [co] = await sql<{ name: string; profile: Record<string, unknown> }[]>`
-    SELECT name, profile FROM companies WHERE id = ${companyId}`;
-  const docs = await sql<{ type: string; content: string }[]>`
-    SELECT type, content FROM documents WHERE company_id = ${companyId} AND content <> '' ORDER BY type`;
-  const nodes = await sql<{ node_type: string; data: Record<string, unknown> }[]>`
-    SELECT node_type, data FROM context_graph WHERE company_id = ${companyId} ORDER BY node_type`;
+  // Independent reads — run them concurrently (this sits in front of every agent run).
+  const [[co], docs, nodes] = await Promise.all([
+    sql<{ name: string; profile: Record<string, unknown> }[]>`
+      SELECT name, profile FROM companies WHERE id = ${companyId}`,
+    sql<{ type: string; content: string }[]>`
+      SELECT type, content FROM documents WHERE company_id = ${companyId} AND content <> '' ORDER BY type`,
+    sql<{ node_type: string; data: Record<string, unknown> }[]>`
+      SELECT node_type, data FROM context_graph WHERE company_id = ${companyId} ORDER BY node_type`,
+  ]);
 
   if (!co) return "";
   const parts: string[] = ["# Company context", `Company: ${co.name}`];

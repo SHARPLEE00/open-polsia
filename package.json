@@ -10,7 +10,8 @@
     "ceo": "node --env-file-if-exists=.env --import tsx scripts/ceo.ts",
     "autopilot": "node --env-file-if-exists=.env --import tsx scripts/autopilot.ts",
     "seed": "node --env-file-if-exists=.env --import tsx scripts/seed.ts",
-    "dashboard": "node --env-file-if-exists=.env --import tsx src/services/dashboard.ts"
+    "dashboard": "node --env-file-if-exists=.env --import tsx src/services/dashboard.ts",
+    "loadtest": "node --env-file-if-exists=.env --import tsx scripts/loadtest.ts"
   },
   "dependencies": {
     "@daytonaio/sdk": "^0.192.0",
